@@ -7,7 +7,6 @@
 #SBATCH --output=minimap_%A_%a.out
 #SBATCH --error=minimap_%A_%a.err
 #SBATCH --mail-type=ALL
-#SBATCH --mail-user=lauryn.deaville@univ.ox.ac.uk
 #SBATCH --array=1-96%10  # Adjust the percentage to control the number of simultaneous jobs
 
 module load minimap2/2.17
