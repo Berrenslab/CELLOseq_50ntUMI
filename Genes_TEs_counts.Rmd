@@ -1,0 +1,331 @@
+title: "celloseq_2cell_SCE"
+author: "Lauryn A. Deaville"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, 
+        encoding = encoding, output_file = '/project/CELLOseq/lmcleand/natprot_CELLO/TE_exp/celloseq_2cell_repeatpreprocessing.html') })
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## set up
+
+```{r packages, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(SingleCellExperiment)
+library(readr)
+library(scater)
+library(scran)
+library(pheatmap)
+library(readr)
+library(tibble)
+library(reshape2)
+library(Matrix)
+library(viridis)
+library(irlba)
+library(biomaRt)
+library(scuttle)
+library(scRNAseq)
+library(tidyverse)
+library(ggplot2)
+library(egg)
+rm(list=ls())
+```
+
+# preprocessing_repeat_files
+filter repeatmasker table file (rmsk.txt.gz from database) from UCSC after preprocessing to calculate age of TEs (adapted from age_TE_jukescantor.py)
+```{r mouse_TE_age_filtering}
+mouse_TE_age <- read.delim2("/project/CELLOseq/lmcleand/mm39_flair/rmsk.txt", header=FALSE, sep="\t", stringsAsFactors = FALSE) %>% drop_na()
+col.names <- c("X.bin", "swScore", "milliDiv", "milliDel", "milliIns", "genoName", "genoStart", "genoEnd", "genoLeft", "strand", "repName", "repClass", "repFamily", "repStart", "repEnd", "repLeft", "id")
+colnames(mouse_TE_age) <- col.names
+  
+# Calculate JC distance
+mouse_TE_age$jc_dist <- -0.75 * log(1 - (4/3 * (mouse_TE_age$milliDiv / 1000)))
+
+# substitution rate of mouse genome from Waterston et al., 2002
+mouse_TE_age$jc_dist <- as.numeric(mouse_TE_age$jc_dist)
+mouse_TE_age$mya <- (mouse_TE_age$jc_dist*100)/(4.5*2*100)*1000
+
+# filter repeat annotation file
+mouse_TE_age$repFamily <- gsub("\\?","", mouse_TE_age$repFamily)
+mouse_TE_age$repClass <- gsub("\\?","", mouse_TE_age$repClass)
+mouse_TE_age_filtered <- mouse_TE_age[!mouse_TE_age$repFamily == "Simple_repeat",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repClass == "Low_complexity",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repClass == "RNA",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repClass == "RC",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repClass == "Unknown",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repFamily == "Other",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repFamily == "srpRNA",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repFamily == "snRNA",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repFamily == "scRNA",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repFamily == "tRNA",]
+mouse_TE_age_filtered <- mouse_TE_age_filtered[!mouse_TE_age_filtered$repFamily == "rRNA",]
+saveRDS(mouse_TE_age_filtered, "/project/CELLOseq/lmcleand/mm39_flair/mm39_TE_age_filtered.rds")
+
+# L1Md 
+mouse_TE_age_filtered_L1Md <- mouse_TE_age_filtered[grep("L1Md", mouse_TE_age_filtered$repName),]
+saveRDS(mouse_TE_age_filtered_L1Md, "/project/CELLOseq/lmcleand/mm39_flair/mm39_TE_age_filtered_L1Md.rds")
+
+mouse_TE_age_filtered_L1Md <- readRDS("/project/CELLOseq/lmcleand/mm39_flair/mm39_TE_age_filtered_L1Md.rds")
+mouse_TE_age_filtered <- readRDS("/project/CELLOseq/lmcleand/mm39_flair/mm39_TE_age_filtered.rds")
+```
+
+## BEFORE PROCEEDING you need to run the python script create_unique_repeat_annot.py and then the bash script TE_isoform_filter to generate repeat_isoform_readnames.txt files 
+
+## SCE_long_read
+FLAIR does not always assign reads correctly to TEs, therefore we have generated read files overlapping to TEs using bed intersect with a custom script for each mouse and human TEs.
+
+```{r load in flair align output and repeat/ repeat isoforms readnames}
+#read in flair align output
+counts_lr <- read.table("/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/flair_quantify_out", sep="", header=TRUE, stringsAsFactors = FALSE)
+
+repeat_isoforms_readnames <- read.csv("/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/2cell_subset_repeat_isoform_readnames.txt",header=F, sep=";", stringsAsFactors = FALSE)
+
+repeat_readnames <- read.delim("/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/2cell_subset_repeat_readnames.txt", header=F, sep=";", stringsAsFactors = FALSE)
+repeat_readnames$V3 <- "gene_id"
+```
+
+```{r rename reads to repeats or repeat_isoforms}
+# assign unique TEs
+counts_lr$rows <- counts_lr$ids
+counts_lr$ids <- gsub("\\-1\\_","\\_", counts_lr$ids)
+counts_lr$ids <- gsub("\\_ENSG\\d+\\.\\d+","", counts_lr$ids)
+counts_lr$ids <- gsub("\\_chr\\d+\\:\\d+","", counts_lr$ids)
+counts_lr$ids <- gsub("\\_chr[X,Y,M]\\:\\d+","", counts_lr$ids)
+
+# repeats
+# known repeats in GTF
+counts_lr_repeats <- counts_lr[grep("barcode\\_\\d+\\.fastq\\_\\ConsRead\\_\\d+\\_\\d+",counts_lr$ids),]
+counts_lr_repeats$ids <- gsub("ConsRead\\_\\d+\\_\\d+\\_barcode\\_\\d+\\_", "",counts_lr_repeats$ids)
+counts_lr_repeats <- counts_lr_repeats[!grepl("ERCC",counts_lr_repeats$ids),]
+counts_lr_repeats_readnames <- data.frame(counts_lr_repeats$rows, counts_lr_repeats$ids, stringsAsFactors = FALSE)
+counts_lr_repeats_readnames$chr_start_end <-  str_extract(counts_lr_repeats_readnames$counts_lr_repeats.ids, 'chr*')
+colnames(counts_lr_repeats_readnames) <- c("ids","repeat_ids", "chr_start_end")
+counts_lr_repeats_readnames_unique <- counts_lr_repeats_readnames[!duplicated(counts_lr_repeats_readnames[,c("repeat_ids")]),]
+
+# bed intersect to find more repeats not found by flair
+colnames(repeat_readnames) <- c("ids", "repeat_ids","chr_start_end")
+repeat_readnames$repeat_ids <- gsub(" ","", repeat_readnames$repeat_ids)
+repeat_readnames <- repeat_readnames[1:2]
+repeat_readnames$chr_start_end <-  str_extract(repeat_readnames$repeat_ids, 'chr.*')
+repeat_readnames_duplicate <- repeat_readnames[duplicated(repeat_readnames[,c("repeat_ids")]),]
+repeat_readnames_unique <- repeat_readnames[!duplicated(repeat_readnames[,c("repeat_ids")]),]
+
+# combine known and unknown
+repeat_readnames_all <- rbind(counts_lr_repeats_readnames_unique, repeat_readnames_unique) 
+repeat_readnames_all_duplicate <- repeat_readnames_all[duplicated(repeat_readnames_all[,c("repeat_ids")]),]
+repeat_readnames_all <- repeat_readnames_all[!duplicated(repeat_readnames_all[,c("repeat_ids")]),]
+
+#repeat_isoforms
+# not nested
+colnames(repeat_isoforms_readnames) <- c("ids", "repeat_isoform_ids")
+repeat_isoforms_readnames <- repeat_isoforms_readnames[1:2]
+repeat_isoforms_readnames_unique <- repeat_isoforms_readnames[!duplicated(repeat_isoforms_readnames$ids),]
+
+# merge counts matrix with repeat_isoform_aggregate
+counts_lr_repeat_isoforms_merged <- counts_lr %>% dplyr::left_join(repeat_isoforms_readnames, by = join_by(ids)) %>% dplyr::left_join(repeat_readnames_all, by = join_by(ids))
+
+# join 2 dataframes
+counts_lr_repeat_isoforms_merged$ids <- ifelse(!is.na(counts_lr_repeat_isoforms_merged$repeat_isoform_ids), counts_lr_repeat_isoforms_merged$repeat_isoform_ids, counts_lr_repeat_isoforms_merged$ids)
+
+counts_lr_repeat_isoforms_merged$ids <- ifelse(!is.na(counts_lr_repeat_isoforms_merged$repeat_ids), counts_lr_repeat_isoforms_merged$repeat_ids, counts_lr_repeat_isoforms_merged$ids)
+
+# assign repeat or repeat_isoform
+counts_lr_repeat_isoforms_merged$source = ifelse(!is.na(counts_lr_repeat_isoforms_merged$repeat_isoform_ids), "repeat_isoform", ifelse(!is.na(counts_lr_repeat_isoforms_merged$repeat_ids), "repeat", "genic"))
+counts_lr_repeat_isoforms_merged_unique <- with(counts_lr_repeat_isoforms_merged, ave(as.character(rows), ids, FUN = make.unique))
+counts_lr_repeat_isoforms_merged$rows <- counts_lr_repeat_isoforms_merged_unique
+counts_lr_repeat_isoforms_merged_repeats <- counts_lr_repeat_isoforms_merged[counts_lr_repeat_isoforms_merged$source == "repeat",]
+saveRDS(counts_lr_repeat_isoforms_merged_repeats, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/counts_lr_repeat_isoforms_merged_repeats.rds")
+```
+```{r make dataframe for repeats, ERCC, repeat_isoform and genes}
+# changing names
+
+counts_lr_repeat_isoforms_merged$names <- counts_lr_repeat_isoforms_merged$rows
+
+# rename
+counts_lr_repeat_isoforms_merged$rows <- gsub("ConsRead\\_\\d+\\_\\d+_barcode[\\_\\-]\\d+\\_","", counts_lr_repeat_isoforms_merged$rows)
+
+## repeats
+counts_lr_repeat_isoforms_repeats <- counts_lr_repeat_isoforms_merged[counts_lr_repeat_isoforms_merged$source == "repeat",]
+
+# collate
+counts_lr_repeat_isoforms_repeats <- rowsum(as.matrix(counts_lr_repeat_isoforms_repeats[2:97]), counts_lr_repeat_isoforms_repeats$ids)
+dim(counts_lr_repeat_isoforms_repeats)
+
+# add column to matrix with type
+type <- rep("repeats", nrow(counts_lr_repeat_isoforms_repeats))
+counts_lr_repeat_isoforms_repeats_df <- counts_lr_repeat_isoforms_repeats %>% data.frame()
+counts_lr_repeat_isoforms_repeats_df <- cbind(counts_lr_repeat_isoforms_repeats_df, type)
+
+## repeat_isoforms
+counts_lr_repeat_isoforms_repeat_isoforms <- counts_lr_repeat_isoforms_merged[counts_lr_repeat_isoforms_merged$source == "repeat_isoform", ]
+
+# filter our duplicates
+sum(duplicated(counts_lr_repeat_isoforms_repeat_isoforms$ids))
+# collate
+counts_lr_repeat_isoforms_repeat_isoforms <- rowsum(as.matrix(counts_lr_repeat_isoforms_repeat_isoforms[2:97]), counts_lr_repeat_isoforms_repeat_isoforms$ids)
+
+dim(counts_lr_repeat_isoforms_repeat_isoforms)
+
+# add column to matrix with type
+type <- rep("repeat_isoforms", nrow(counts_lr_repeat_isoforms_repeat_isoforms))
+counts_lr_repeat_isoforms_repeat_isoforms_df <- counts_lr_repeat_isoforms_repeat_isoforms %>% data.frame()
+counts_lr_repeat_isoforms_repeat_isoforms_df <- cbind(counts_lr_repeat_isoforms_repeat_isoforms_df, type)
+
+## known_isoform
+counts_lr_repeat_isoforms_repeat_isoform <- counts_lr_repeat_isoforms_merged[counts_lr_repeat_isoforms_merged$source == "genic",]
+counts_lr_repeat_isoforms_repeat_isoform_known <- counts_lr_repeat_isoforms_repeat_isoform[grep("ENSMUST",counts_lr_repeat_isoforms_repeat_isoform$rows),]
+
+# collate
+counts_lr_repeat_isoforms_repeat_isoform_known <- rowsum(as.matrix(counts_lr_repeat_isoforms_repeat_isoform_known[2:97]), counts_lr_repeat_isoforms_repeat_isoform_known$rows)
+dim(counts_lr_repeat_isoforms_repeat_isoform_known)
+
+# add column to matrix with type
+type <- rep("known_isoform", nrow(counts_lr_repeat_isoforms_repeat_isoform_known))
+counts_lr_repeat_isoforms_repeat_isoform_known_df <- counts_lr_repeat_isoforms_repeat_isoform_known %>% data.frame()
+counts_lr_repeat_isoforms_repeat_isoform_known_df <- cbind(counts_lr_repeat_isoforms_repeat_isoform_known_df, type)
+
+####
+## novel_isoform
+counts_lr_repeat_isoforms_repeat_isoform <- counts_lr_repeat_isoforms_merged[counts_lr_repeat_isoforms_merged$source == "genic",]
+counts_lr_repeat_isoforms_repeat_isoform_novel <- counts_lr_repeat_isoforms_repeat_isoform[grep("ENSMUSG",counts_lr_repeat_isoforms_repeat_isoform$rows),]
+
+# collate
+counts_lr_repeat_isoforms_repeat_isoform_novel <- rowsum(as.matrix(counts_lr_repeat_isoforms_repeat_isoform_novel[2:97]), counts_lr_repeat_isoforms_repeat_isoform_novel$rows)
+
+dim(counts_lr_repeat_isoforms_repeat_isoform_novel)
+
+# add column to matrix with type
+type <- rep("novel_isoform", nrow(counts_lr_repeat_isoforms_repeat_isoform_novel))
+counts_lr_repeat_isoforms_repeat_isoform_novel_df <- counts_lr_repeat_isoforms_repeat_isoform_novel %>% data.frame()
+counts_lr_repeat_isoforms_repeat_isoform_novel_df <- cbind(counts_lr_repeat_isoforms_repeat_isoform_novel_df, type)
+
+### genic
+# select only genic
+counts_lr_repeat_isoforms_repeat_genic <- counts_lr_repeat_isoforms_merged[counts_lr_repeat_isoforms_merged$source == "genic",]
+counts_lr_repeat_isoforms_repeat_genic <- counts_lr_repeat_isoforms_repeat_genic[grep("ENSMUSG",counts_lr_repeat_isoforms_repeat_genic$rows),]
+
+# collate
+counts_lr_repeat_isoforms_repeat_genic <- rowsum(as.matrix(counts_lr_repeat_isoforms_repeat_genic[2:97]), counts_lr_repeat_isoforms_repeat_genic$rows)
+dim(counts_lr_repeat_isoforms_repeat_genic)
+
+# add column to matrix with type
+type <- rep("genic", nrow(counts_lr_repeat_isoforms_repeat_genic))
+counts_lr_repeat_isoforms_repeat_genic_df <- counts_lr_repeat_isoforms_repeat_genic %>% data.frame()
+counts_lr_repeat_isoforms_repeat_genic_df <- cbind(counts_lr_repeat_isoforms_repeat_genic_df, type)
+
+#merge all dataframes
+counts_lr_combined_df <- rbind(counts_lr_repeat_isoforms_repeat_genic_df, counts_lr_repeat_isoforms_repeats_df)
+saveRDS(counts_lr_combined_df, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/counts_lr_combined_genic_df.rds")
+
+## counts_lr_combined_isoforms_df <- rbind(counts_lr_repeat_isoforms_repeat_isoform_novel_df, counts_lr_repeat_isoforms_repeat_isoform_known_df, counts_lr_repeat_isoforms_repeats_df)
+## saveRDS(counts_lr_combined_isoforms_df, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/counts_lr_combined_isoforms_df.rds")
+```
+
+```{r build single cell experiment for genes}
+# Form a sce 
+count_cols = grepl("barcode_", colnames(counts_lr_combined_df))
+sce_lr <- SingleCellExperiment(assays=list(counts=as.matrix(counts_lr_combined_df[, count_cols])))
+
+# define feature names in feature_symbol column
+rowData(sce_lr)$feature_symbol <- rowData(sce_lr)$rows
+rowData(sce_lr) = counts_lr_combined_df[, !count_cols]
+
+# define spike in data
+is.spike <- rowData(sce_lr)$value == "ERCC"
+sce_lr <- splitAltExps(sce_lr, ifelse(is.spike, "ERCC", "gene"))
+#rowData(altExp(sce_lr))$concentration <- runif(nrow(altExp(sce_lr)))
+#rowData(altExp(sce_lr))
+
+# Save statistics on these libraries
+cur_stats <- melt(table(colData(sce_lr)$cell_type, colData(sce_lr)$gender))
+cur_stats <- cur_stats[cur_stats$value > 0,]
+cur_stats <- cur_stats[order(cur_stats$Var1),]
+stats.df <- data.frame(row.names = cur_stats$Var2,
+                       Sample = cur_stats$Var1,
+                       gender = cur_stats$Var2,
+                       n_cells = cur_stats$value)
+```
+
+
+```{r QC}
+unfiltered <- sce_lr
+stats <- perCellQCMetrics(sce_lr)
+
+colData(sce_lr)$libsize <- stats$sum
+colData(sce_lr)$genes <- stats$detected
+
+# Remove genes that are not expressed
+sce_lr <- sce_lr[Matrix::rowSums(counts(sce_lr)) > 0,]
+sce_lr <- scater::addPerFeatureQC(sce_lr)
+rowData(sce_lr)
+
+# Add to stats data frame
+cur_stats <- melt(table(colData(sce_lr)$cell_type))
+cur_stats <- cur_stats[cur_stats$value > 0,]
+cur_stats <- cur_stats[order(cur_stats$Var1),]
+stats.df$AfterFiltering <-cur_stats$value
+
+saveRDS(sce_lr, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/SCE_lr_all.rds")
+
+# genes per reads
+sce_lr_genic <- sce_lr[rowData(sce_lr)$value == "genic", ]
+unfiltered <- sce_lr_genic
+stats <- perCellQCMetrics(sce_lr_genic)
+
+colData(sce_lr_genic)$libsize <- stats$sum
+colData(sce_lr_genic)$genes <- stats$detected
+
+ggplot(stats, aes(x=stats$sum, y=stats$detected)) + geom_point() + theme_bw()
+p1 <- ggplot(stats, aes(y=stats$detected)) + geom_boxplot() + theme_bw() + ylim(0, 1200)
+p2 <- ggplot(stats, aes(y=stats$sum)) + geom_boxplot() + theme_bw() + ylim(0, 4000)
+
+ggarrange(p2, p1, ncol = 2)
+
+saveRDS(sce_lr_genic, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/SCE_lr_genes.rds")
+
+write.table(counts(sce_lr_genic), "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/raw_counts_lr_genes.txt")
+write.table(colData(sce_lr_genic), "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/cell_metadata_lr_genes.txt")
+write.table(rowData(sce_lr_genic), "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/cell_rowdata_lr_genes.txt")
+write.table(rownames(sce_lr_genic),"/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/genes_lr_genes.tsv", sep = "\t", row.names = FALSE)
+```
+
+# preprocessing_repeat_files
+```{r assign TE locations}
+# load in single cell object with all features
+SCE_lr_all <- readRDS("/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/SCE_lr_all.rds")
+# define repeats
+is.repeat <- rowData(SCE_lr_all)$value == "repeats"
+# make SCE for repeats
+SCE_lr_repeats <- splitAltExps(SCE_lr_all, ifelse(is.repeat, "repeats", "gene"))
+
+saveRDS(SCE_lr_repeats, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/SCE_lr_repeats.rds") 
+
+repstats <- perCellQCMetrics(SCE_lr_repeats)
+colData(SCE_lr_repeats)$libsize <- repstats$sum
+colData(SCE_lr_repeats)$genes <- repstats$detected
+
+ggplot(repstats, aes(x=repstats$sum, y=repstats$detected)) + geom_point()
+
+# extract counts and logcounts
+counts_SCE_lr_repeats <- data.frame(counts(SCE_lr_repeats))
+
+# add genomic location to all TEs in SCE for counts
+counts_SCE_lr_repeats$chromosome_name = str_extract(rownames(counts_SCE_lr_repeats), pattern = "chr[0-9]+|chrX|chrY")
+location <- sapply(strsplit(rownames(counts_SCE_lr_repeats), "_chr[0-9]+_|_chrX_|_chrY_"), "[", 2)
+counts_SCE_lr_repeats$start_position <- sapply(strsplit(location, "-"),"[", 1)
+counts_SCE_lr_repeats$end_position <- sapply(strsplit(location, "-"),"[", 2)
+counts_SCE_lr_repeats$end_position <- as.numeric(counts_SCE_lr_repeats$end_position)
+counts_SCE_lr_repeats$start_position <- as.numeric(counts_SCE_lr_repeats$start_position)
+counts_SCE_lr_repeats$name <- sapply(strsplit(rownames(counts_SCE_lr_repeats), "_chr"), "[", 1)
+
+saveRDS(counts_SCE_lr_repeats, "/project/CELLOseq/lmcleand/natprot_CELLO/corrected_cello/counts_lr_repeats.rds") 
+
+
+```
