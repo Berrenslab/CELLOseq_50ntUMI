@@ -101,6 +101,8 @@ counts_lr$ids <- gsub("\\_chr[X,Y,M]\\:\\d+","", counts_lr$ids)
 
 # repeats
 # known repeats in GTF
+# be careful if your gtf has Chr1 or 1 notation, below is for Chr
+# for 1 notation, use X instead of str_extract(counts_lr_repeats_readnames$counts_lr_repeats.ids, 'chr*')
 counts_lr_repeats <- counts_lr[grep("barcode\\_\\d+\\.fastq\\_\\ConsRead\\_\\d+\\_\\d+",counts_lr$ids),]
 counts_lr_repeats$ids <- gsub("ConsRead\\_\\d+\\_\\d+\\_barcode\\_\\d+\\_", "",counts_lr_repeats$ids)
 counts_lr_repeats <- counts_lr_repeats[!grepl("ERCC",counts_lr_repeats$ids),]
